@@ -296,9 +296,15 @@ router.put('/:id/leads/:leadId/status', authenticate, requireRole('ADMIN', 'OWNE
   try {
     const { id: trackerId, leadId } = req.params;
     const { status } = req.body;
-    const validStatuses = ['NEW', 'CONTACTED', 'QUALIFIED', 'CONVERTED', 'LOST'];
 
-    if (!validStatuses.includes(status)) {
+    // Dynamic validation: check against tracker's custom lead statuses
+    const customStatuses = await query(
+      'SELECT statusName FROM TrackerCustomStatuses WHERE trackerId = ? AND category = ?',
+      [trackerId, 'LEAD']
+    );
+    const validStatuses = customStatuses.map(s => s.statusName);
+
+    if (validStatuses.length > 0 && !validStatuses.includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status' });
     }
 

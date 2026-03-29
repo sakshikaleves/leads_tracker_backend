@@ -10,15 +10,10 @@ router.get('/:id/team/dashboard', authenticate, requireRole('ADMIN', 'OWNER'), a
   try {
     const { id: trackerId } = req.params;
 
-    // Per-member lead counts
-    const memberStats = await query(
+    // Per-member lead counts (totals only)
+    const memberBasic = await query(
       `SELECT u.userId, u.name, u.email, tm.role,
-              COUNT(l.leadId) as totalLeads,
-              SUM(CASE WHEN l.status = 'NEW' THEN 1 ELSE 0 END) as newLeads,
-              SUM(CASE WHEN l.status = 'CONTACTED' THEN 1 ELSE 0 END) as contactedLeads,
-              SUM(CASE WHEN l.status = 'QUALIFIED' THEN 1 ELSE 0 END) as qualifiedLeads,
-              SUM(CASE WHEN l.status = 'CONVERTED' THEN 1 ELSE 0 END) as convertedLeads,
-              SUM(CASE WHEN l.status = 'LOST' THEN 1 ELSE 0 END) as lostLeads
+              COUNT(l.leadId) as totalLeads
        FROM TrackerMembers tm
        INNER JOIN Users u ON tm.userId = u.userId
        LEFT JOIN Leads l ON l.leadOwnerId = u.userId AND l.trackerId = tm.trackerId
@@ -28,22 +23,49 @@ router.get('/:id/team/dashboard', authenticate, requireRole('ADMIN', 'OWNER'), a
       [trackerId]
     );
 
+    // Per-member status breakdown (dynamic — works with custom statuses)
+    const memberStatusCounts = await query(
+      `SELECT l.leadOwnerId as userId, l.status, COUNT(*) as count
+       FROM Leads l WHERE l.trackerId = ?
+       GROUP BY l.leadOwnerId, l.status`,
+      [trackerId]
+    );
+
+    // Merge into memberStats
+    const memberStats = memberBasic.map(m => {
+      const statusCounts = {};
+      memberStatusCounts
+        .filter(sc => sc.userId === m.userId)
+        .forEach(sc => { statusCounts[sc.status] = sc.count; });
+      return { ...m, statusCounts };
+    });
+
     // Overall status breakdown
     const statusBreakdown = await query(
       `SELECT status, COUNT(*) as count FROM Leads WHERE trackerId = ? GROUP BY status`,
       [trackerId]
     );
 
-    // Leads assigned but not converted
+    // Get success status names for this tracker
+    const successStatuses = await query(
+      `SELECT statusName FROM TrackerCustomStatuses WHERE trackerId = ? AND category = 'LEAD' AND statusType = 'SUCCESS'`,
+      [trackerId]
+    );
+    const successNames = successStatuses.map(s => s.statusName);
+    const convertedCondition = successNames.length > 0
+      ? `l.status IN (${successNames.map(() => '?').join(',')})`
+      : `l.status = 'CONVERTED'`;
+
+    // Leads assigned — with conversion count
     const assignmentStats = await query(
       `SELECT u.name, u.email,
               COUNT(l.leadId) as assignedLeads,
-              SUM(CASE WHEN l.status = 'CONVERTED' THEN 1 ELSE 0 END) as converted
+              SUM(CASE WHEN ${convertedCondition} THEN 1 ELSE 0 END) as converted
        FROM Leads l
        INNER JOIN Users u ON l.assignedTo = u.userId
        WHERE l.trackerId = ? AND l.assignedTo IS NOT NULL
        GROUP BY u.userId, u.name, u.email`,
-      [trackerId]
+      [...successNames, trackerId]
     );
 
     // Total leads

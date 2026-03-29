@@ -1,0 +1,14 @@
+-- OrgInvitations table for invite-only registration
+CREATE TABLE IF NOT EXISTS OrgInvitations (
+  id INT NOT NULL AUTO_INCREMENT,
+  orgId VARCHAR(36) NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  role ENUM('ORG_ADMIN', 'ORG_MEMBER') NOT NULL DEFAULT 'ORG_MEMBER',
+  status ENUM('PENDING', 'ACCEPTED') NOT NULL DEFAULT 'PENDING',
+  invitedBy VARCHAR(36) NOT NULL,
+  createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_org_invite_email (orgId, email),
+  FOREIGN KEY (orgId) REFERENCES Organizations(orgId) ON DELETE CASCADE,
+  FOREIGN KEY (invitedBy) REFERENCES Users(userId) ON DELETE RESTRICT
+)

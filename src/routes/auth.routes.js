@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const { query } = require('../config/database');
 const { hashPassword, comparePassword, generateToken } = require('../services/auth.service');
 const { authenticate } = require('../middleware/auth');
+const config = require('../config/env');
 
 const router = express.Router();
 
@@ -46,6 +47,24 @@ router.post('/register', validateRegister, async (req, res, next) => {
       });
     }
 
+    // Invite-only check: must have a pending OrgInvitation or tracker Invitation, or be a super admin
+    const isSuperAdmin = config.superAdminEmails.includes(email);
+    const orgInvites = await query(
+      `SELECT id FROM OrgInvitations WHERE email = ? AND status = 'PENDING'`,
+      [email]
+    );
+    const trackerInvites = await query(
+      `SELECT id FROM Invitations WHERE email = ? AND status = 'PENDING'`,
+      [email]
+    );
+
+    if (!isSuperAdmin && orgInvites.length === 0 && trackerInvites.length === 0) {
+      return res.status(403).json({
+        success: false,
+        message: 'Registration is invite-only. Please contact your admin or reach out at hitesh@tresto.io',
+      });
+    }
+
     // Create user
     const userId = uuidv4();
     const passwordHash = await hashPassword(password);
@@ -57,23 +76,37 @@ router.post('/register', validateRegister, async (req, res, next) => {
       [userId, name, email, passwordHash, phoneNumber || null, now, now]
     );
 
-    // Auto-accept pending invitations for this email
+    // Auto-accept pending tracker invitations for this email
     const pendingInvites = await query(
       `SELECT id, trackerId, role FROM Invitations WHERE email = ? AND status = 'PENDING'`,
       [email]
     );
 
     for (const invite of pendingInvites) {
-      // Add user as member of the tracker
       await query(
         `INSERT INTO TrackerMembers (trackerId, userId, role, canAddLeads, canEditLeads, createdAt)
          VALUES (?, ?, ?, ?, ?, ?)`,
         [invite.trackerId, userId, invite.role, invite.role === 'BDA', invite.role === 'BDA', now]
       );
-
-      // Mark invitation as accepted
       await query(
         `UPDATE Invitations SET status = 'ACCEPTED' WHERE id = ?`,
+        [invite.id]
+      );
+    }
+
+    // Auto-accept pending org invitations for this email
+    const pendingOrgInvites = await query(
+      `SELECT id, orgId, role, invitedBy FROM OrgInvitations WHERE email = ? AND status = 'PENDING'`,
+      [email]
+    );
+
+    for (const invite of pendingOrgInvites) {
+      await query(
+        `INSERT INTO OrgMembers (orgId, userId, role, addedBy, createdAt) VALUES (?, ?, ?, ?, ?)`,
+        [invite.orgId, userId, invite.role, invite.invitedBy, now]
+      );
+      await query(
+        `UPDATE OrgInvitations SET status = 'ACCEPTED' WHERE id = ?`,
         [invite.id]
       );
     }
@@ -146,6 +179,7 @@ router.post('/login', validateLogin, async (req, res, next) => {
         name: user.name,
         email: user.email,
         phoneNumber: user.phoneNumber,
+        isSuperAdmin: config.superAdminEmails.includes(user.email),
         token,
       },
     });
@@ -171,7 +205,7 @@ router.get('/me', authenticate, async (req, res, next) => {
 
     res.json({
       success: true,
-      data: result[0],
+      data: { ...result[0], isSuperAdmin: config.superAdminEmails.includes(result[0].email) },
     });
   } catch (error) {
     next(error);

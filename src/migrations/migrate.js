@@ -33,6 +33,9 @@ async function runMigrations() {
     await runMigrationFile(pool, '002_org_bda_restructure.sql');
     await runMigrationFile(pool, '003_team_features.sql');
     await runMigrationFile(pool, '004_crm_enhancements.sql');
+    await runMigrationFile(pool, '005_custom_lead_statuses.sql');
+    await runMigrationFile(pool, '007_organizations.sql');
+    await runMigrationFile(pool, '008_org_invitations.sql');
 
     console.log('\nAll migrations completed successfully!');
   } catch (error) {

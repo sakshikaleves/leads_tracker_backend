@@ -11,6 +11,7 @@ const analyticsRoutes = require('./routes/analytics.routes');
 const teamRoutes = require('./routes/team.routes');
 const callerInteractionRoutes = require('./routes/callerInteraction.routes');
 const customStatusRoutes = require('./routes/customStatus.routes');
+const orgRoutes = require('./routes/org.routes');
 
 const app = express();
 
@@ -31,6 +32,7 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/trackers', teamRoutes);
 app.use('/api/trackers', callerInteractionRoutes);
 app.use('/api/trackers', customStatusRoutes);
+app.use('/api', orgRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

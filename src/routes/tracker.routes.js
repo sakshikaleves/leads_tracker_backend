@@ -22,16 +22,16 @@ router.post('/', authenticate, validateTracker, async (req, res, next) => {
       return res.status(400).json({ success: false, errors: errors.array() });
     }
 
-    const { trackerName, businessName, trackerMode } = req.body;
+    const { trackerName, businessName, trackerMode, orgId } = req.body;
     const userId = req.user.userId;
     const trackerId = uuidv4();
     const now = new Date();
 
     // Create tracker
     await query(
-      `INSERT INTO Trackers (trackerId, trackerName, businessName, trackerMode, createdBy, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [trackerId, trackerName, businessName, trackerMode, userId, now, now]
+      `INSERT INTO Trackers (trackerId, trackerName, businessName, trackerMode, orgId, createdBy, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [trackerId, trackerName, businessName, trackerMode, orgId || null, userId, now, now]
     );
 
     // Add creator as OWNER
@@ -40,6 +40,21 @@ router.post('/', authenticate, validateTracker, async (req, res, next) => {
        VALUES (?, ?, ?, ?, ?, ?)`,
       [trackerId, userId, 'OWNER', true, true, now]
     );
+
+    // Seed default lead statuses
+    const defaultLeadStatuses = [
+      { name: 'NEW', order: 1, color: 'blue', type: 'ACTIVE' },
+      { name: 'CONTACTED', order: 2, color: 'yellow', type: 'ACTIVE' },
+      { name: 'QUALIFIED', order: 3, color: 'purple', type: 'ACTIVE' },
+      { name: 'CONVERTED', order: 4, color: 'green', type: 'SUCCESS' },
+      { name: 'LOST', order: 5, color: 'red', type: 'FAILED' },
+    ];
+    for (const s of defaultLeadStatuses) {
+      await query(
+        'INSERT INTO TrackerCustomStatuses (trackerId, category, statusName, statusOrder, statusColor, statusType) VALUES (?, ?, ?, ?, ?, ?)',
+        [trackerId, 'LEAD', s.name, s.order, s.color, s.type]
+      );
+    }
 
     res.status(201).json({
       success: true,
@@ -58,12 +73,23 @@ router.get('/', authenticate, async (req, res, next) => {
 
     const result = await query(
       `SELECT t.trackerId, t.trackerName, t.businessName, t.trackerMode,
-              t.createdAt, tm.role
+              t.createdAt,
+              COALESCE(tm.role,
+                CASE WHEN om.role = 'ORG_ADMIN' THEN 'ADMIN' ELSE NULL END
+              ) as role,
+              CASE
+                WHEN tm.role IS NOT NULL THEN 1
+                WHEN om.role = 'ORG_ADMIN' THEN 1
+                ELSE 0
+              END as hasAccess,
+              (SELECT COUNT(*) FROM Leads l WHERE l.trackerId = t.trackerId) as leadCount,
+              (SELECT COUNT(*) FROM TrackerMembers m WHERE m.trackerId = t.trackerId) as memberCount
        FROM Trackers t
-       INNER JOIN TrackerMembers tm ON t.trackerId = tm.trackerId
-       WHERE tm.userId = ?
+       LEFT JOIN TrackerMembers tm ON t.trackerId = tm.trackerId AND tm.userId = ?
+       LEFT JOIN OrgMembers om ON t.orgId = om.orgId AND om.userId = ?
+       WHERE tm.userId IS NOT NULL OR om.userId IS NOT NULL
        ORDER BY t.createdAt DESC`,
-      [userId]
+      [userId, userId]
     );
 
     res.json({
@@ -84,6 +110,20 @@ router.get('/:id', authenticate, async (req, res, next) => {
     // Check membership
     const membership = await getTrackerMembership(userId, id);
     if (!membership) {
+      // Check if user is at least an org member (can see but not access)
+      const orgCheck = await query(
+        `SELECT om.role FROM OrgMembers om
+         INNER JOIN Trackers t ON t.orgId = om.orgId
+         WHERE om.userId = ? AND t.trackerId = ?`,
+        [userId, id]
+      );
+      if (orgCheck[0]) {
+        return res.status(403).json({
+          success: false,
+          message: 'You need to be added as a member to access this tracker',
+          code: 'TRACKER_LOCKED',
+        });
+      }
       return res.status(403).json({
         success: false,
         message: 'You do not have access to this tracker',
@@ -114,6 +154,16 @@ router.get('/:id', authenticate, async (req, res, next) => {
       [id]
     );
 
+    // Check if user is ORG_ADMIN
+    let isOrgAdmin = false;
+    if (result[0].orgId) {
+      const orgAdminCheck = await query(
+        'SELECT role FROM OrgMembers WHERE orgId = ? AND userId = ? AND role = ?',
+        [result[0].orgId, userId, 'ORG_ADMIN']
+      );
+      isOrgAdmin = orgAdminCheck.length > 0;
+    }
+
     res.json({
       success: true,
       data: {
@@ -121,6 +171,7 @@ router.get('/:id', authenticate, async (req, res, next) => {
         memberCount: membersResult[0].memberCount,
         leadCount: leadsResult[0].leadCount,
         myRole: membership.role,
+        isOrgAdmin,
       },
     });
   } catch (error) {
@@ -348,6 +399,32 @@ router.get('/:id/members', authenticate, requireRole('ADMIN', 'OWNER', 'MEMBER',
   }
 });
 
+// GET /api/trackers/:id/org-members - List org members not yet in this tracker
+router.get('/:id/org-members', authenticate, requireRole('ADMIN', 'OWNER'), async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const tracker = await query('SELECT orgId FROM Trackers WHERE trackerId = ?', [id]);
+    if (!tracker[0]?.orgId) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const members = await query(
+      `SELECT u.userId, u.name, u.email, u.phoneNumber, om.role as orgRole
+       FROM OrgMembers om
+       INNER JOIN Users u ON om.userId = u.userId
+       WHERE om.orgId = ?
+         AND om.userId NOT IN (SELECT userId FROM TrackerMembers WHERE trackerId = ?)
+       ORDER BY u.name`,
+      [tracker[0].orgId, id]
+    );
+
+    res.json({ success: true, data: members });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // POST /api/trackers/:id/invite - Admin invites BDA by email
 router.post('/:id/invite', authenticate, requireRole('ADMIN', 'OWNER'), async (req, res, next) => {
   try {
@@ -440,6 +517,40 @@ router.get('/:id/invitations', authenticate, requireRole('ADMIN', 'OWNER'), asyn
     );
 
     res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// DELETE /api/trackers/:id - Delete tracker (ORG_ADMIN only)
+router.delete('/:id', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    // Get the tracker and its org
+    const tracker = await query('SELECT trackerId, trackerName, orgId FROM Trackers WHERE trackerId = ?', [id]);
+    if (!tracker[0]) {
+      return res.status(404).json({ success: false, message: 'Tracker not found' });
+    }
+
+    if (!tracker[0].orgId) {
+      return res.status(403).json({ success: false, message: 'Tracker has no org — cannot delete' });
+    }
+
+    // Check if user is ORG_ADMIN of this tracker's org
+    const orgMember = await query(
+      'SELECT role FROM OrgMembers WHERE orgId = ? AND userId = ?',
+      [tracker[0].orgId, userId]
+    );
+
+    if (!orgMember[0] || orgMember[0].role !== 'ORG_ADMIN') {
+      return res.status(403).json({ success: false, message: 'Only org admins can delete trackers' });
+    }
+
+    await query('DELETE FROM Trackers WHERE trackerId = ?', [id]);
+
+    res.json({ success: true, message: `Tracker "${tracker[0].trackerName}" deleted` });
   } catch (error) {
     next(error);
   }

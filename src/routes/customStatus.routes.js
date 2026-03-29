@@ -9,9 +9,10 @@ const router = express.Router();
 router.get('/:id/custom-statuses', authenticate, requireRole('ADMIN', 'OWNER', 'BDA', 'MEMBER', 'VIEWER'), async (req, res, next) => {
   try {
     const { id: trackerId } = req.params;
+    const category = req.query.category || 'CALLER';
     const result = await query(
-      'SELECT * FROM TrackerCustomStatuses WHERE trackerId = ? ORDER BY statusOrder ASC',
-      [trackerId]
+      'SELECT * FROM TrackerCustomStatuses WHERE trackerId = ? AND category = ? ORDER BY statusOrder ASC',
+      [trackerId, category]
     );
     res.json({ success: true, data: result });
   } catch (error) {
@@ -23,27 +24,27 @@ router.get('/:id/custom-statuses', authenticate, requireRole('ADMIN', 'OWNER', '
 router.post('/:id/custom-statuses', authenticate, requireRole('ADMIN', 'OWNER'), async (req, res, next) => {
   try {
     const { id: trackerId } = req.params;
-    const { statusName, statusColor = 'gray', statusType = 'NEUTRAL' } = req.body;
+    const { statusName, statusColor = 'gray', statusType = 'NEUTRAL', category = 'CALLER' } = req.body;
 
     if (!statusName || !statusName.trim()) {
       return res.status(400).json({ success: false, message: 'Status name is required' });
     }
 
-    // Get next order
+    // Get next order scoped by category
     const maxOrder = await query(
-      'SELECT MAX(statusOrder) as maxOrder FROM TrackerCustomStatuses WHERE trackerId = ?',
-      [trackerId]
+      'SELECT MAX(statusOrder) as maxOrder FROM TrackerCustomStatuses WHERE trackerId = ? AND category = ?',
+      [trackerId, category]
     );
     const nextOrder = (maxOrder[0]?.maxOrder || 0) + 1;
 
     const result = await query(
-      'INSERT INTO TrackerCustomStatuses (trackerId, statusName, statusOrder, statusColor, statusType) VALUES (?, ?, ?, ?, ?)',
-      [trackerId, statusName.trim(), nextOrder, statusColor, statusType]
+      'INSERT INTO TrackerCustomStatuses (trackerId, category, statusName, statusOrder, statusColor, statusType) VALUES (?, ?, ?, ?, ?, ?)',
+      [trackerId, category, statusName.trim(), nextOrder, statusColor, statusType]
     );
 
     res.status(201).json({
       success: true,
-      data: { id: result.insertId, trackerId, statusName: statusName.trim(), statusOrder: nextOrder, statusColor, statusType },
+      data: { id: result.insertId, trackerId, category, statusName: statusName.trim(), statusOrder: nextOrder, statusColor, statusType },
     });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
@@ -81,15 +82,43 @@ router.put('/:id/custom-statuses/:statusId', authenticate, requireRole('ADMIN', 
 // DELETE /api/trackers/:id/custom-statuses/:statusId - Delete custom status
 router.delete('/:id/custom-statuses/:statusId', authenticate, requireRole('ADMIN', 'OWNER'), async (req, res, next) => {
   try {
+    const { id: trackerId } = req.params;
     const { statusId } = req.params;
 
-    // Check if in use
-    const inUse = await query(
-      'SELECT COUNT(*) as count FROM CallerInteractions WHERE status = (SELECT statusName FROM TrackerCustomStatuses WHERE id = ?)',
-      [statusId]
-    );
-    if (inUse[0].count > 0) {
-      return res.status(400).json({ success: false, message: 'Cannot delete status that is in use by caller interactions' });
+    // Get the status details to check category
+    const statusRow = await query('SELECT * FROM TrackerCustomStatuses WHERE id = ?', [statusId]);
+    if (statusRow.length === 0) {
+      return res.status(404).json({ success: false, message: 'Status not found' });
+    }
+
+    const status = statusRow[0];
+
+    if (status.category === 'LEAD') {
+      // For lead statuses, check if any leads use this status
+      const inUse = await query(
+        'SELECT COUNT(*) as count FROM Leads WHERE trackerId = ? AND status = ?',
+        [trackerId, status.statusName]
+      );
+      if (inUse[0].count > 0) {
+        return res.status(400).json({ success: false, message: 'Cannot delete status that is in use by leads' });
+      }
+      // Prevent deleting the last lead status
+      const remaining = await query(
+        'SELECT COUNT(*) as count FROM TrackerCustomStatuses WHERE trackerId = ? AND category = ? AND id != ?',
+        [trackerId, 'LEAD', statusId]
+      );
+      if (remaining[0].count === 0) {
+        return res.status(400).json({ success: false, message: 'Cannot delete the last lead status' });
+      }
+    } else {
+      // For caller statuses, check CallerInteractions
+      const inUse = await query(
+        'SELECT COUNT(*) as count FROM CallerInteractions WHERE status = (SELECT statusName FROM TrackerCustomStatuses WHERE id = ?)',
+        [statusId]
+      );
+      if (inUse[0].count > 0) {
+        return res.status(400).json({ success: false, message: 'Cannot delete status that is in use by caller interactions' });
+      }
     }
 
     await query('DELETE FROM TrackerCustomStatuses WHERE id = ?', [statusId]);
