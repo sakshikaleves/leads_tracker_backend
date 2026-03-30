@@ -171,6 +171,15 @@ router.post('/login', validateLogin, async (req, res, next) => {
     // Generate token
     const token = generateToken({ userId: user.userId, email: user.email });
 
+    // Get user's org memberships
+    const orgs = await query(
+      `SELECT om.orgId, o.orgName, om.role as orgRole
+       FROM OrgMembers om
+       INNER JOIN Organizations o ON om.orgId = o.orgId
+       WHERE om.userId = ?`,
+      [user.userId]
+    );
+
     res.json({
       success: true,
       message: 'Login successful',
@@ -180,6 +189,7 @@ router.post('/login', validateLogin, async (req, res, next) => {
         email: user.email,
         phoneNumber: user.phoneNumber,
         isSuperAdmin: config.superAdminEmails.includes(user.email),
+        orgs,
         token,
       },
     });
@@ -203,9 +213,22 @@ router.get('/me', authenticate, async (req, res, next) => {
       });
     }
 
+    // Get user's org memberships
+    const orgs = await query(
+      `SELECT om.orgId, o.orgName, om.role as orgRole
+       FROM OrgMembers om
+       INNER JOIN Organizations o ON om.orgId = o.orgId
+       WHERE om.userId = ?`,
+      [req.user.userId]
+    );
+
     res.json({
       success: true,
-      data: { ...result[0], isSuperAdmin: config.superAdminEmails.includes(result[0].email) },
+      data: {
+        ...result[0],
+        isSuperAdmin: config.superAdminEmails.includes(result[0].email),
+        orgs,
+      },
     });
   } catch (error) {
     next(error);
