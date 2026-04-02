@@ -2,6 +2,7 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { v4: uuidv4 } = require('uuid');
 const { query } = require('../config/database');
+const config = require('../config/env');
 const { authenticate } = require('../middleware/auth');
 const { requireRole, getTrackerMembership } = require('../middleware/permissions');
 
@@ -71,6 +72,8 @@ router.get('/', authenticate, async (req, res, next) => {
   try {
     const userId = req.user.userId;
 
+    const isSuperAdmin = config.superAdminEmails.includes(req.user.email);
+
     const result = await query(
       `SELECT t.trackerId, t.trackerName, t.businessName, t.trackerMode,
               t.createdAt,
@@ -87,9 +90,10 @@ router.get('/', authenticate, async (req, res, next) => {
        FROM Trackers t
        LEFT JOIN TrackerMembers tm ON t.trackerId = tm.trackerId AND tm.userId = ?
        LEFT JOIN OrgMembers om ON t.orgId = om.orgId AND om.userId = ?
-       WHERE tm.userId IS NOT NULL OR om.userId IS NOT NULL
+       WHERE (om.userId IS NOT NULL OR (tm.userId IS NOT NULL AND t.orgId IS NOT NULL))
+         ${isSuperAdmin ? 'OR t.createdBy = (SELECT userId FROM Users WHERE email = ? LIMIT 1)' : ''}
        ORDER BY t.createdAt DESC`,
-      [userId, userId]
+      isSuperAdmin ? [userId, userId, req.user.email] : [userId, userId]
     );
 
     res.json({
