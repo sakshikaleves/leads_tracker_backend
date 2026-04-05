@@ -5,6 +5,7 @@ const { query } = require('../config/database');
 const config = require('../config/env');
 const { authenticate } = require('../middleware/auth');
 const { requireRole, getTrackerMembership } = require('../middleware/permissions');
+const { sendTrackerInviteEmail, sendMemberAddedEmail } = require('../services/email.service');
 
 const router = express.Router();
 
@@ -90,8 +91,9 @@ router.get('/', authenticate, async (req, res, next) => {
        FROM Trackers t
        LEFT JOIN TrackerMembers tm ON t.trackerId = tm.trackerId AND tm.userId = ?
        LEFT JOIN OrgMembers om ON t.orgId = om.orgId AND om.userId = ?
-       WHERE (om.userId IS NOT NULL OR (tm.userId IS NOT NULL AND t.orgId IS NOT NULL))
-         ${isSuperAdmin ? 'OR t.createdBy = (SELECT userId FROM Users WHERE email = ? LIMIT 1)' : ''}
+       WHERE t.archivedAt IS NULL
+         AND (om.userId IS NOT NULL OR (tm.userId IS NOT NULL AND t.orgId IS NOT NULL))
+         ${isSuperAdmin ? 'OR (t.archivedAt IS NULL AND t.createdBy = (SELECT userId FROM Users WHERE email = ? LIMIT 1))' : ''}
        ORDER BY t.createdAt DESC`,
       isSuperAdmin ? [userId, userId, req.user.email] : [userId, userId]
     );
@@ -230,11 +232,11 @@ router.post('/:id/duplicate', authenticate, requireRole('ADMIN', 'OWNER'), async
     const newTrackerId = uuidv4();
     const now = new Date();
 
-    // Create duplicate (without leads)
+    // Create duplicate (without leads) — include orgId so it can be deleted
     await query(
-      `INSERT INTO Trackers (trackerId, trackerName, businessName, trackerMode, createdBy, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [newTrackerId, newTrackerName || `${tracker.trackerName} (Copy)`, tracker.businessName, tracker.trackerMode, userId, now, now]
+      `INSERT INTO Trackers (trackerId, trackerName, businessName, trackerMode, orgId, createdBy, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newTrackerId, newTrackerName || `${tracker.trackerName} (Copy)`, tracker.businessName, tracker.trackerMode, tracker.orgId, userId, now, now]
     );
 
     // Add creator as OWNER
@@ -481,6 +483,11 @@ router.post('/:id/invite', authenticate, requireRole('ADMIN', 'OWNER'), async (r
         [trackerId, email, inviteRole, req.user.userId, now]
       );
 
+      // Send email notification
+      const inviter = await query('SELECT name FROM Users WHERE userId = ?', [req.user.userId]);
+      const trackerInfo = await query('SELECT trackerName FROM Trackers WHERE trackerId = ?', [trackerId]);
+      sendMemberAddedEmail(email, trackerInfo[0]?.trackerName || 'a tracker', inviteRole, inviter[0]?.name || 'An admin').catch(() => {});
+
       return res.status(201).json({
         success: true,
         message: 'User added to tracker directly (already registered)',
@@ -495,6 +502,11 @@ router.post('/:id/invite', authenticate, requireRole('ADMIN', 'OWNER'), async (r
        VALUES (?, ?, ?, 'PENDING', ?, ?)`,
       [trackerId, email, inviteRole, req.user.userId, now]
     );
+
+    // Send invite email to unregistered user
+    const inviter = await query('SELECT name FROM Users WHERE userId = ?', [req.user.userId]);
+    const trackerInfo = await query('SELECT trackerName FROM Trackers WHERE trackerId = ?', [trackerId]);
+    sendTrackerInviteEmail(email, trackerInfo[0]?.trackerName || 'a tracker', inviter[0]?.name || 'An admin').catch(() => {});
 
     res.status(201).json({
       success: true,
@@ -526,35 +538,121 @@ router.get('/:id/invitations', authenticate, requireRole('ADMIN', 'OWNER'), asyn
   }
 });
 
-// DELETE /api/trackers/:id - Delete tracker (ORG_ADMIN only)
+// DELETE /api/trackers/:id - Archive tracker (soft-delete, 90-day retention)
 router.delete('/:id', authenticate, async (req, res, next) => {
   try {
     const { id } = req.params;
     const userId = req.user.userId;
 
     // Get the tracker and its org
-    const tracker = await query('SELECT trackerId, trackerName, orgId FROM Trackers WHERE trackerId = ?', [id]);
+    const tracker = await query('SELECT trackerId, trackerName, orgId FROM Trackers WHERE trackerId = ? AND archivedAt IS NULL', [id]);
     if (!tracker[0]) {
       return res.status(404).json({ success: false, message: 'Tracker not found' });
     }
 
-    if (!tracker[0].orgId) {
-      return res.status(403).json({ success: false, message: 'Tracker has no org — cannot delete' });
+    // Allow OWNER or ORG_ADMIN to archive
+    const membership = await getTrackerMembership(userId, id);
+    const isOwner = membership && membership.role === 'OWNER';
+
+    let isOrgAdmin = false;
+    if (tracker[0].orgId) {
+      const orgMember = await query(
+        'SELECT role FROM OrgMembers WHERE orgId = ? AND userId = ?',
+        [tracker[0].orgId, userId]
+      );
+      isOrgAdmin = orgMember[0]?.role === 'ORG_ADMIN';
     }
 
-    // Check if user is ORG_ADMIN of this tracker's org
-    const orgMember = await query(
-      'SELECT role FROM OrgMembers WHERE orgId = ? AND userId = ?',
-      [tracker[0].orgId, userId]
+    if (!isOwner && !isOrgAdmin) {
+      return res.status(403).json({ success: false, message: 'Only tracker owner or org admin can delete trackers' });
+    }
+
+    const now = new Date();
+    await query('UPDATE Trackers SET archivedAt = ?, archivedBy = ? WHERE trackerId = ?', [now, userId, id]);
+
+    // Notify members via email
+    const { sendTrackerDeletedEmail } = require('../services/email.service');
+    const user = await query('SELECT name FROM Users WHERE userId = ?', [userId]);
+    const members = await query(
+      `SELECT u.email FROM TrackerMembers tm INNER JOIN Users u ON tm.userId = u.userId WHERE tm.trackerId = ?`,
+      [id]
+    );
+    const deletedByName = user[0]?.name || 'An admin';
+    for (const m of members) {
+      sendTrackerDeletedEmail(m.email, tracker[0].trackerName, deletedByName).catch(() => {});
+    }
+
+    res.json({ success: true, message: `Tracker "${tracker[0].trackerName}" archived. It can be restored within 90 days.` });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/trackers/:id/restore - Restore archived tracker (ORG_ADMIN only)
+router.post('/:id/restore', authenticate, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    const tracker = await query('SELECT trackerId, trackerName, orgId, archivedAt FROM Trackers WHERE trackerId = ?', [id]);
+    if (!tracker[0]) {
+      return res.status(404).json({ success: false, message: 'Tracker not found' });
+    }
+    if (!tracker[0].archivedAt) {
+      return res.status(400).json({ success: false, message: 'Tracker is not archived' });
+    }
+
+    // Check 90-day window
+    const daysSinceArchive = (Date.now() - new Date(tracker[0].archivedAt).getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSinceArchive > 90) {
+      return res.status(410).json({ success: false, message: 'Tracker archive has expired (>90 days). It can no longer be restored.' });
+    }
+
+    // Only ORG_ADMIN or OWNER can restore
+    const membership = await getTrackerMembership(userId, id);
+    const isOwner = membership && membership.role === 'OWNER';
+
+    let isOrgAdmin = false;
+    if (tracker[0].orgId) {
+      const orgMember = await query(
+        'SELECT role FROM OrgMembers WHERE orgId = ? AND userId = ?',
+        [tracker[0].orgId, userId]
+      );
+      isOrgAdmin = orgMember[0]?.role === 'ORG_ADMIN';
+    }
+
+    if (!isOwner && !isOrgAdmin) {
+      return res.status(403).json({ success: false, message: 'Only tracker owner or org admin can restore trackers' });
+    }
+
+    await query('UPDATE Trackers SET archivedAt = NULL, archivedBy = NULL WHERE trackerId = ?', [id]);
+
+    res.json({ success: true, message: `Tracker "${tracker[0].trackerName}" restored successfully` });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/trackers/archived - List archived trackers
+router.get('/list/archived', authenticate, async (req, res, next) => {
+  try {
+    const userId = req.user.userId;
+
+    const result = await query(
+      `SELECT t.trackerId, t.trackerName, t.businessName, t.archivedAt, t.archivedBy,
+              u.name as archivedByName,
+              DATEDIFF(DATE_ADD(t.archivedAt, INTERVAL 90 DAY), NOW()) as daysRemaining
+       FROM Trackers t
+       LEFT JOIN Users u ON t.archivedBy = u.userId
+       LEFT JOIN OrgMembers om ON t.orgId = om.orgId AND om.userId = ?
+       LEFT JOIN TrackerMembers tm ON t.trackerId = tm.trackerId AND tm.userId = ?
+       WHERE t.archivedAt IS NOT NULL
+         AND (om.role = 'ORG_ADMIN' OR tm.role = 'OWNER')
+       ORDER BY t.archivedAt DESC`,
+      [userId, userId]
     );
 
-    if (!orgMember[0] || orgMember[0].role !== 'ORG_ADMIN') {
-      return res.status(403).json({ success: false, message: 'Only org admins can delete trackers' });
-    }
-
-    await query('DELETE FROM Trackers WHERE trackerId = ?', [id]);
-
-    res.json({ success: true, message: `Tracker "${tracker[0].trackerName}" deleted` });
+    res.json({ success: true, data: result });
   } catch (error) {
     next(error);
   }

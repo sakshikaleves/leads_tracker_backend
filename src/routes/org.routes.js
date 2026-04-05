@@ -156,7 +156,16 @@ router.get('/orgs/:orgId/members', authenticate, requireOrgAdmin, async (req, re
 
     const org = await query('SELECT orgId, orgName FROM Organizations WHERE orgId = ?', [orgId]);
 
-    res.json({ success: true, data: { org: org[0], members } });
+    // Get pending invitations
+    const invitations = await query(
+      `SELECT id, email, role, status, createdAt
+       FROM OrgInvitations
+       WHERE orgId = ?
+       ORDER BY createdAt DESC`,
+      [orgId]
+    );
+
+    res.json({ success: true, data: { org: org[0], members, invitations } });
   } catch (error) {
     next(error);
   }
